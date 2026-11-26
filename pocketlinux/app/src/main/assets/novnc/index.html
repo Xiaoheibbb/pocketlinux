@@ -1,0 +1,589 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>PocketLinux</title>
+<style>
+html,body{margin:0;padding:0;height:100%;background:#000;overflow:hidden;touch-action:none;
+  -webkit-user-select:none;user-select:none}
+#wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+canvas{display:block;background:#000;image-rendering:auto}
+#cur{position:fixed;width:18px;height:18px;margin:-9px 0 0 -9px;border:2px solid #7fd4ff;border-radius:50%;
+  box-shadow:0 0 4px #000;pointer-events:none;z-index:8;display:none;opacity:.9}
+#cur:after{content:'';position:absolute;left:50%;top:50%;width:3px;height:3px;margin:-1.5px 0 0 -1.5px;
+  background:#7fd4ff;border-radius:50%}
+#cur.drag{border-color:#ffb14e;opacity:1}
+#cur.drag:after{background:#ffb14e}
+#st{position:fixed;left:8px;bottom:8px;color:#9cf;font:10px monospace;z-index:9;opacity:.5;pointer-events:none;
+  transition:opacity .4s}
+#kb{position:fixed;left:10px;bottom:14px;width:44px;height:44px;border-radius:22px;background:#334;
+  color:#fff;font:20px/44px sans-serif;text-align:center;opacity:.55;z-index:10}
+#hm{position:fixed;right:10px;bottom:70px;width:36px;height:36px;border-radius:18px;background:#334;
+  color:#fff;font:16px/36px sans-serif;text-align:center;opacity:.5;z-index:10}
+#help{position:fixed;left:12px;right:12px;top:50%;transform:translateY(-50%);background:#101018ee;
+  color:#e8ecf6;font:13px/1.9 sans-serif;padding:16px 18px;border-radius:14px;z-index:11;display:none;
+  border:1px solid #2a2a3a}
+#kbi{position:fixed;left:-9999px;top:0;width:10px;height:10px;opacity:0}
+</style></head><body>
+<div id="wrap"><canvas id="c"></canvas></div><div id="cur"></div>
+<div id="st">连接中…</div>
+<input id="kbi" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false">
+<script>
+const st=document.getElementById('st');
+const canvas=document.getElementById('c'), ctx=canvas.getContext('2d',{alpha:false});
+const wrap=document.getElementById('wrap');
+const kbi=document.getElementById('kbi');
+
+// ---------- 流式缓冲（避免 O(n^2) 拷贝） ----------
+let buf=new Uint8Array(1<<20), start=0, end=0;
+function append(u8){
+  const need=u8.length;
+  if(end+need>buf.length){
+    if(start>0){ buf.copyWithin(0,start,end); end-=start; start=0; }
+    if(end+need>buf.length){
+      let cap=buf.length; while(cap<end+need) cap*=2;
+      const nb=new Uint8Array(cap); nb.set(buf.subarray(0,end)); buf=nb;
+    }
+  }
+  buf.set(u8,end); end+=need;
+}
+const available=()=>end-start;
+let dbg={start:0,move:0,end:0,cancel:0,down:0,up:0};
+function dbgLine(){ st.textContent='s'+dbg.start+' m'+dbg.move+' e'+dbg.end+' c'+dbg.cancel+' p'+dbg.down+' r'+dbg.up;
+  st.style.opacity=.9; clearTimeout(hideTimer); hideTimer=setTimeout(()=>{st.style.opacity=.35;},8000); }
+
+// ---------- 状态机 ----------
+let ws=null, state='version', fbW=0, fbH=0, img=null, bytesPerPixel=4, retry=0;
+let frames=0, pendingReq=false;
+
+let hideTimer=null;
+function log(m,keep){
+  st.textContent=m; st.style.opacity=.5;
+  clearTimeout(hideTimer);
+  if(!keep) hideTimer=setTimeout(()=>{st.style.opacity=0;},4000);
+}
+
+function fit(){
+  if(!fbW||!fbH) return;
+  const vw=wrap.clientWidth, vh=wrap.clientHeight;
+  const s=Math.min(vw/fbW, vh/fbH);
+  const w=Math.max(1,Math.floor(fbW*s)), h=Math.max(1,Math.floor(fbH*s));
+  canvas.style.width=w+'px';
+  canvas.style.height=h+'px';
+}
+window.addEventListener('resize',fit);
+
+function connect(){
+  buf=new Uint8Array(1<<20); start=0; end=0;
+  state='version'; fbW=0; fbH=0; img=null; pendingReq=false;
+  ws=new WebSocket('ws://127.0.0.1:6080/websockify',['binary']);
+  ws.binaryType='arraybuffer';
+  ws.onopen=()=>{ log('已连接'); retry=0; };
+  ws.onmessage=e=>{ append(new Uint8Array(e.data)); process(); };
+  ws.onerror=()=>{ log('连接失败，重试中…'); };
+  ws.onclose=()=>{ log('已断开，重试 '+(++retry)); setTimeout(connect, 800); };
+}
+
+function send(u8){ if(ws&&ws.readyState===1) ws.send(u8); }
+function sendText(t){ send(new TextEncoder().encode(t)); }
+
+function process(){
+  try{
+    for(;;){
+      if(state==='version'){
+        if(available()<12) break;
+        start+=12; sendText('RFB 003.008\n'); state='security';
+      }else if(state==='security'){
+        if(available()<1) break;
+        const n=buf[start]; if(available()<1+n){ break; }
+        start+=1+n; send(new Uint8Array([1])); state='secresult';
+      }else if(state==='secresult'){
+        if(available()<4) break;
+        start+=4; send(new Uint8Array([1])); state='serverinit';
+      }else if(state==='serverinit'){
+        if(available()<24) break;
+        const off=start;
+        fbW=(buf[off]<<8)|buf[off+1]; fbH=(buf[off+2]<<8)|buf[off+3];
+        const nl=((buf[off+20]<<24)|(buf[off+21]<<16)|(buf[off+22]<<8)|buf[off+23])>>>0;
+        if(available()<24+nl) break;
+        start+=24+nl;
+        canvas.width=fbW; canvas.height=fbH;
+        fit(); setTimeout(fit,150); setTimeout(fit,600);
+        img=ctx.createImageData(fbW,fbH);
+        const spf=new Uint8Array(20);
+        spf[4]=16; spf[5]=16; spf[6]=0; spf[7]=1;   // bpp=16 depth=16 truecolor little-endian
+        spf[8]=0; spf[9]=31; spf[10]=0; spf[11]=63; spf[12]=0; spf[13]=31;   // r/g/b max (big-endian)
+        spf[14]=11; spf[15]=5; spf[16]=0;            // r/g/b shift
+        send(spf);
+        send(new Uint8Array([2,0,0,1,0,0,0,0]));     // SetEncodings: Raw
+        bytesPerPixel=2;
+        state='updates';
+        log('桌面 '+fbW+'×'+fbH);
+        initPointer();
+        req(0);
+      }else if(state==='updates'){
+        if(available()<1) break;
+        const type=buf[start];
+        if(type===1){                       // SetColourMapEntries
+          if(available()<6) break;
+          const n1=(buf[start+4]<<8)|buf[start+5];
+          if(available()<6+n1*6) break;
+          start+=6+n1*6; continue;
+        }
+        if(type===2){ start+=1; continue; } // Bell
+        if(type===3){                       // ServerCutText
+          if(available()<8) break;
+          const len=((buf[start+4]<<24)|(buf[start+5]<<16)|(buf[start+6]<<8)|buf[start+7])>>>0;
+          if(available()<8+len) break;
+          start+=8+len; continue;
+        }
+        if(type!==0){ start+=1; continue; } // 未知消息，跳过 1 字节自愈
+        if(available()<4) break;
+        const off=start;
+        const nr=(buf[off+2]<<8)|buf[off+3];
+        let p=off+4, ok=true; const rects=[];
+        for(let i=0;i<nr;i++){
+          if(end-p<12){ ok=false; break; }
+          const x=(buf[p]<<8)|buf[p+1], y=(buf[p+2]<<8)|buf[p+3];
+          const w=(buf[p+4]<<8)|buf[p+5], h=(buf[p+6]<<8)|buf[p+7];
+          const enc=((buf[p+8]<<24)|(buf[p+9]<<16)|(buf[p+10]<<8)|buf[p+11])>>>0;
+          p+=12;
+          if(enc!==0){ ok=false; break; }           // 只接受 Raw
+          const dl=w*h*bytesPerPixel;
+          if(end-p<dl){ ok=false; break; }
+          rects.push({x,y,w,h,p,dl}); p+=dl;
+        }
+        if(!ok) break;
+        start=p;
+        for(const r of rects) blit(r);
+        frames++;
+        ctx.putImageData(img,0,0);
+        if(frames<=3||frames%60===0){ log('桌面 '+fbW+'×'+fbH+' 帧'+frames); fit(); }
+        pendingReq=false;
+        req(1);
+      }
+    }
+    // 回收已消费数据
+    if(start>0){ buf.copyWithin(0,start,end); end-=start; start=0; }
+  }catch(err){ log('解码错误 '+err); }
+}
+
+function blit(r){
+  const d=buf, base=r.p;
+  if(bytesPerPixel===4){
+    for(let yy=0;yy<r.h;yy++){
+      let si=base+yy*r.w*4, di=((r.y+yy)*fbW+r.x)*4;
+      for(let xx=0;xx<r.w;xx++){
+        img.data[di]=d[si+2]; img.data[di+1]=d[si+1]; img.data[di+2]=d[si]; img.data[di+3]=255;
+        si+=4; di+=4;
+      }
+    }
+  }else{
+    for(let yy=0;yy<r.h;yy++){
+      let si=base+yy*r.w*2, di=((r.y+yy)*fbW+r.x)*4;
+      for(let xx=0;xx<r.w;xx++){
+        const v=(d[si]|(d[si+1]<<8));
+        const r5=(v>>11)&31, g6=(v>>5)&63, b5=v&31;
+        img.data[di]=(r5*255/31)|0;
+        img.data[di+1]=(g6*255/63)|0;
+        img.data[di+2]=(b5*255/31)|0;
+        img.data[di+3]=255;
+        si+=2; di+=4;
+      }
+    }
+  }
+}
+
+function req(inc){
+  if(!ws||ws.readyState!==1||!fbW) return;
+  const b=new Uint8Array(10);
+  b[0]=3; b[1]=inc?1:0;
+  b[6]=(fbW>>8)&255; b[7]=fbW&255;
+  b[8]=(fbH>>8)&255; b[9]=fbH&255;
+  send(b);
+}
+
+// ---------- 指针 ----------
+function sendPointer(mask,x,y){
+  if(!ws||ws.readyState!==1||!fbW) return;
+  const b=new Uint8Array(6);
+  b[0]=5; b[1]=mask;
+  b[2]=(x>>8)&255; b[3]=x&255; b[4]=(y>>8)&255; b[5]=y&255;
+  send(b);
+}
+
+// ===== 触摸 =====
+// 由原生 View 转发：window.plTouch(action, pts)，pts 是 0~1 相对视口坐标。
+// 两种模式：
+//   trackpad（默认，电脑触控板式）：单指滑动=移指针、轻点=左键、双击=双击、双指滑=滚轮、
+//                                  双指轻点=右键、单指按住 0.4s 后滑=按住左键拖拽、三指上滑=键盘
+//   direct（老式“点哪按哪”）：window.PL_TOUCH_MODE='direct' 时启用（保留原行为）
+window.PL_VER='pl9';
+const TOUCH_MODE_DEFAULT='trackpad';
+const SENS_DEFAULT=1.6, SENS_MIN=0.8, SENS_MAX=2.5;   // 灵敏度：window.PL_TRACKPAD_SENS，设置页可接
+function touchMode(){
+  const m=String(window.PL_TOUCH_MODE||TOUCH_MODE_DEFAULT).toLowerCase();
+  return m==='direct'?'direct':'trackpad';
+}
+function trackpadSens(){
+  let v=Number(window.PL_TRACKPAD_SENS);
+  if(!isFinite(v)||v<=0) v=SENS_DEFAULT;
+  return Math.min(SENS_MAX,Math.max(SENS_MIN,v));
+}
+
+// 视口 0~1 坐标 → fb 坐标。fbOf 不截断（算相对位移用）；vToFb 截断（绝对定位用）
+function fbOf(fx,fy){
+  const vw=document.documentElement.clientWidth||window.innerWidth;
+  const vh=document.documentElement.clientHeight||window.innerHeight;
+  const r=canvas.getBoundingClientRect();
+  return [(fx*vw-r.left)/r.width*fbW, (fy*vh-r.top)/r.height*fbH];
+}
+function vToFb(fx,fy){
+  const p=fbOf(fx,fy);
+  return [Math.max(0,Math.min(fbW-1,Math.round(p[0]))),
+          Math.max(0,Math.min(fbH-1,Math.round(p[1])))];
+}
+
+// 本地指针（触控板模式下“系统指针”的位置，fb 坐标）与 #cur 圆环
+const curEl=document.getElementById('cur');
+let ptrX=0, ptrY=0, ptrReady=false, dragging=false;
+function moveCursor(x,y){
+  if(!fbW||!fbH) return;
+  const r=canvas.getBoundingClientRect();
+  curEl.style.display='block';
+  curEl.style.left=(r.left+x/fbW*r.width)+'px';
+  curEl.style.top=(r.top+y/fbH*r.height)+'px';
+}
+function setCursorDrag(on){
+  dragging=!!on;
+  if(curEl.classList) curEl.classList.toggle('drag',!!on);
+}
+function clampPtr(){
+  ptrX=Math.max(0,Math.min(fbW-1,Math.round(ptrX)));
+  ptrY=Math.max(0,Math.min(fbH-1,Math.round(ptrY)));
+}
+// 首帧（serverinit）后调用：触控板模式把本地光标和 X 端指针都初始化到画面中心
+function initPointer(){
+  if(!fbW||!fbH) return;
+  ptrReady=true;
+  ptrX=Math.floor(fbW/2); ptrY=Math.floor(fbH/2);
+  if(touchMode()==='trackpad'){
+    moveCursor(ptrX,ptrY); setCursorDrag(false);
+    sendPointer(0,ptrX,ptrY);
+  }
+}
+
+// 低层点击/滚轮（坐标均为 fb 坐标）
+// clickAt：立即按下，hold 毫秒后松开；若上一次松开还没发出，先同步补发，避免两次点击压在一起
+const CLICK_HOLD_MS=40;
+let clickTimer=null, clickX=0, clickY=0;
+function clickAt(x,y,btn,hold){
+  if(clickTimer){ clearTimeout(clickTimer); clickTimer=null; sendPointer(0,clickX,clickY); }
+  sendPointer(btn||1,x,y); clickX=x; clickY=y;
+  clickTimer=setTimeout(()=>{ clickTimer=null; sendPointer(0,clickX,clickY); },hold||CLICK_HOLD_MS);
+}
+function flushClick(){
+  if(clickTimer){ clearTimeout(clickTimer); clickTimer=null; sendPointer(0,clickX,clickY); }
+}
+function wheelAt(x,y,up){ sendPointer(up?8:16,x,y); setTimeout(()=>sendPointer(0,x,y),30); }
+
+// ===== direct：老的“点哪按哪”（window.PL_TOUCH_MODE='direct'） =====
+let dMode='idle', dLastX=0, dLastY=0, dDownX=0, dDownY=0, dDownTime=0;
+let dPressed=false, dMoved=false, dLongTimer=null, dLongPressed=false, dArmTimer=null, dPressedSent=false;
+let dScrollPrevY=0, dScrollAcc=0, dTwoStart=0, dTwoMoved=false, dThreeStartY=0, dKbShown=false;
+function directTouch(action,pts){
+  const n=pts.length;
+  if(action===0){                        // 第一根手指按下（延迟 80ms 再真正按下，给双指留机会）
+    flushClick();
+    const [x,y]=vToFb(pts[0][0],pts[0][1]);
+    dMode='single'; dDownX=dLastX=x; dDownY=dLastY=y; dDownTime=Date.now();
+    dMoved=false; dLongPressed=false; dPressed=true; dPressedSent=false;
+    ptrX=x; ptrY=y;
+    clearTimeout(dArmTimer); clearTimeout(dLongTimer);
+    dArmTimer=setTimeout(()=>{ if(dMode==='single'&&dPressed&&!dPressedSent){ sendPointer(1,dDownX,dDownY); dPressedSent=true; } },80);
+    dLongTimer=setTimeout(()=>{ dLongPressed=!dMoved; },600);
+    return;
+  }
+  if(action===5){                        // 又一根手指按下
+    clearTimeout(dLongTimer); clearTimeout(dArmTimer);
+    if(dPressed&&dPressedSent) sendPointer(0,dLastX,dLastY);
+    dPressed=false; dPressedSent=false;
+    if(n>=3){ dMode='three'; dThreeStartY=pts[0][1]; dKbShown=false; return; }
+    if(n===2){ dMode='scroll'; dScrollPrevY=(pts[0][1]+(pts[1]?pts[1][1]:pts[0][1]))/2;
+      dScrollAcc=0; dTwoStart=Date.now(); dTwoMoved=false; return; }
+  }
+  if(action===2){
+    if(dMode==='three'){
+      if(!dKbShown && (dThreeStartY-pts[0][1])>0.06){ dKbShown=true; plShowKeyboard(); log('键盘'); }
+      return;
+    }
+    if(dMode==='scroll'){
+      let y=pts[0][1]; if(pts.length>=2) y=(pts[0][1]+pts[1][1])/2;
+      dScrollAcc+=(dScrollPrevY-y); dScrollPrevY=y;
+      if(Math.abs(dScrollAcc)>0.012) dTwoMoved=true;
+      const step=dScrollAcc>0.03?1:(dScrollAcc<-0.03?-1:0);
+      if(step){ wheelAt(dLastX,dLastY,step>0); dScrollAcc-=step*0.03; log(step>0?'滚轮↑':'滚轮↓'); }
+      return;
+    }
+    const [x,y]=vToFb(pts[0][0],pts[0][1]);
+    if(Math.abs(x-dDownX)+Math.abs(y-dDownY)>6){ dMoved=true; clearTimeout(dLongTimer); }
+    ptrX=x; ptrY=y; moveCursor(x,y);
+    if(dPressed){
+      if(!dPressedSent){ sendPointer(1,dDownX,dDownY); dPressedSent=true; }  // 先按在起点，抓住对象
+      sendPointer(1,x,y);
+    }
+    dLastX=x; dLastY=y;
+    return;
+  }
+  if(action===6) return;                 // 某根手指抬起但还有手指
+  if(action===3){                        // 被系统取消：只释放，不点击
+    clearTimeout(dArmTimer); clearTimeout(dLongTimer);
+    if(dPressed&&dPressedSent){ moveCursor(dLastX,dLastY); sendPointer(0,dLastX,dLastY); }
+    dPressed=false; dPressedSent=false; dMode='idle'; setCursorDrag(false);
+    return;
+  }
+  if(action===1){                        // 最后一根抬起
+    clearTimeout(dArmTimer); clearTimeout(dLongTimer);
+    const m=dMode; dMode='idle';
+    if(m==='three') return;
+    if(m==='scroll'){
+      if(!dTwoMoved && Date.now()-dTwoStart<350){ clickAt(ptrX,ptrY,2,60); }  // 双指轻点=中键（沿用旧行为）
+      return;
+    }
+    const [x,y]=vToFb(pts[0][0],pts[0][1]);
+    if(dPressed){
+      dPressed=false;
+      if(dPressedSent){
+        dPressedSent=false; sendPointer(0,x,y);
+        if(!dMoved && dLongPressed){ setTimeout(()=>clickAt(x,y,4,60),50); log('右键'); }
+        else if(!dMoved) log('左键');
+      } else if(!dMoved){
+        if(dLongPressed){ clickAt(dDownX,dDownY,4,60); log('右键'); }
+        else { clickAt(dDownX,dDownY,1,60); log('左键'); }
+      }
+    }
+  }
+}
+
+// ===== trackpad：电脑触控板式（默认） =====
+let HOLD_DRAG_MS=400;         // 单指按住多久后允许“按住拖拽”（运行时可变，见 plSetTouchThresholds）
+let LONG_RIGHT_MS=600;        // 单指按住不动再抬手 = 右键（保留，优先级低于双指右键）
+const HOLD_DRAG_MS_MIN=250, HOLD_DRAG_MS_MAX=800;      // 与原生 Settings.clampHoldDragMs 对齐
+const LONG_RIGHT_MS_MIN=400, LONG_RIGHT_MS_MAX=1000;   // 与原生 Settings.clampLongRightMs 对齐
+const TAP_MAX_MOVE=6;         // 判定“轻点”允许的抖动（fb px）
+const DOUBLE_TAP_MS=340;      // 两次轻点间隔小于此值记为双击（X 端按自身 double-click time 判定）
+const SCROLL_MARK=0.012, SCROLL_STEP=0.03;  // 双指滚动：归一化位移的判定/步长
+
+let tMode='idle';             // idle | single | scroll | three
+let tLastFx=0, tLastFy=0, tDownTime=0;
+let tMoved=false, tMovedPx=0, tArmed=false, tDragging=false;
+let tArmTimer=null, tLongTimer=null, tLongRight=false;
+let tScrollPrevY=0, tScrollAcc=0, tTwoStart=0, tTwoMoved=false;
+let tThreeStartY=0, tKbShown=false;
+let tLastTapTime=0;
+
+function tpDown(pts){
+  const fx=pts[0][0], fy=pts[0][1];
+  const now=Date.now();
+  flushClick();                 // 上一次轻点的松开若还没发出，先补发
+  tMode='single';
+  tDownTime=now; tLastFx=fx; tLastFy=fy; tMoved=false; tMovedPx=0;
+  tArmed=false; tDragging=false; tLongRight=false;
+  clearTimeout(tArmTimer); clearTimeout(tLongTimer);
+  tArmTimer=setTimeout(()=>{ if(tMode==='single'&&!tMoved) tArmed=true; },HOLD_DRAG_MS);
+  tLongTimer=setTimeout(()=>{ if(tMode==='single'&&!tMoved) tLongRight=true; },LONG_RIGHT_MS);
+}
+function tpPointerDown(pts){
+  clearTimeout(tArmTimer); clearTimeout(tLongTimer);
+  if(tDragging){ sendPointer(0,ptrX,ptrY); tDragging=false; setCursorDrag(false); }
+  tArmed=false;
+  const n=pts.length;
+  if(n>=3){ tMode='three'; tThreeStartY=pts[0][1]; tKbShown=false; return; }
+  if(n===2){ tMode='scroll'; tScrollPrevY=(pts[0][1]+pts[1][1])/2; tScrollAcc=0;
+    tTwoStart=Date.now(); tTwoMoved=false; log('滚动'); return; }
+}
+function tpMove(pts){
+  if(tMode==='three'){
+    if(!tKbShown && (tThreeStartY-pts[0][1])>0.06){ tKbShown=true; plShowKeyboard(); log('键盘'); }
+    return;
+  }
+  if(tMode==='scroll'){
+    let y=pts[0][1]; if(pts.length>=2) y=(pts[0][1]+pts[1][1])/2;
+    tScrollAcc+=(tScrollPrevY-y); tScrollPrevY=y;
+    if(Math.abs(tScrollAcc)>SCROLL_MARK) tTwoMoved=true;
+    const step=tScrollAcc>SCROLL_STEP?1:(tScrollAcc<-SCROLL_STEP?-1:0);
+    if(step){ wheelAt(ptrX,ptrY,step>0); tScrollAcc-=step*SCROLL_STEP; log(step>0?'滚轮↑':'滚轮↓'); }
+    return;
+  }
+  if(tMode!=='single') return;
+  const fx=pts[0][0], fy=pts[0][1];
+  const [cx,cy]=fbOf(fx,fy), [lx,ly]=fbOf(tLastFx,tLastFy);
+  const ddx=cx-lx, ddy=cy-ly;
+  tLastFx=fx; tLastFy=fy;
+  if(!tMoved){
+    tMovedPx+=Math.abs(ddx)+Math.abs(ddy);
+    if(tMovedPx>TAP_MAX_MOVE){ tMoved=true; clearTimeout(tLongTimer); }
+  }
+  const k=trackpadSens();
+  if(tArmed){                    // 按住 0.4s 后再滑 = 按住左键拖拽
+    if(!tDragging){
+      tDragging=true; setCursorDrag(true); moveCursor(ptrX,ptrY);
+      sendPointer(1,ptrX,ptrY);  // 先在指针当前位置按下（抓住窗口/图标），再按相对位移拖
+      log('拖拽');
+    }
+    ptrX+=ddx*k; ptrY+=ddy*k; clampPtr();
+    moveCursor(ptrX,ptrY); sendPointer(1,ptrX,ptrY);
+    return;
+  }
+  ptrX+=ddx*k; ptrY+=ddy*k; clampPtr();
+  moveCursor(ptrX,ptrY); sendPointer(0,ptrX,ptrY);   // 不按键：只移指针
+}
+function tpUp(pts){
+  clearTimeout(tArmTimer); clearTimeout(tLongTimer);
+  const m=tMode; tMode='idle';
+  if(m==='three') return;
+  if(m==='scroll'){              // 双指轻点 = 右键
+    if(!tTwoMoved && Date.now()-tTwoStart<350){ moveCursor(ptrX,ptrY); clickAt(ptrX,ptrY,4,60); log('右键'); }
+    return;
+  }
+  if(tDragging){                 // 拖拽松手：释放左键
+    tDragging=false; tArmed=false; setCursorDrag(false); sendPointer(0,ptrX,ptrY); log('放开');
+    return;
+  }
+  tArmed=false;
+  if(tMoved) return;             // 滑过：只移指针，不点击
+  if(tLongRight){ clickAt(ptrX,ptrY,4); log('右键'); return; }  // 长按不动再抬手 = 右键
+  // 轻点 = 在当前指针位置左键单击（立即发送，延迟为 0；两次快速轻点自然构成双击）
+  const now=Date.now();
+  const dbl=now-tLastTapTime<DOUBLE_TAP_MS;
+  tLastTapTime=now;
+  clickAt(ptrX,ptrY,1);
+  log(dbl?'双击':'左键');
+}
+function tpCancel(){
+  clearTimeout(tArmTimer); clearTimeout(tLongTimer);
+  if(tDragging){ sendPointer(0,ptrX,ptrY); tDragging=false; setCursorDrag(false); }
+  tArmed=false; tMode='idle';
+}
+
+window.plTouch = function(action, pts){
+  if(!fbW||!pts||!pts.length) return;
+  if(touchMode()==='direct') return directTouch(action,pts);
+  if(action===0) return tpDown(pts);
+  if(action===5) return tpPointerDown(pts);
+  if(action===2) return tpMove(pts);
+  if(action===6) return;
+  if(action===3) return tpCancel();
+  if(action===1) return tpUp(pts);
+};
+
+// 供设置页/原生实时调用（也接受 window.PL_TOUCH_MODE / window.PL_TRACKPAD_SENS 直接赋值）
+window.plSetTouchMode=function(m){
+  const v=(String(m||'').toLowerCase()==='direct')?'direct':'trackpad';
+  window.PL_TOUCH_MODE=v;
+  flushClick();
+  curEl.style.display='none'; setCursorDrag(false);
+  if(v==='trackpad'){
+    if(!ptrReady) initPointer();
+    else { moveCursor(ptrX,ptrY); sendPointer(0,ptrX,ptrY); }
+    log('触控板模式');
+  } else {
+    log('直接触摸模式');
+  }
+};
+window.plSetTrackpadSens=function(v){
+  const f=Number(v);
+  if(isFinite(f)&&f>0) window.PL_TRACKPAD_SENS=f;
+  log('灵敏度 '+trackpadSens().toFixed(1)+'×');
+};
+// 设置页实时调拖拽/右键阈值（毫秒）：hold 250–800，right 400–1000
+window.plSetTouchThresholds=function(holdMs,rightMs){
+  const h=Math.round(Number(holdMs)), r=Math.round(Number(rightMs));
+  if(isFinite(h)) HOLD_DRAG_MS=Math.min(HOLD_DRAG_MS_MAX,Math.max(HOLD_DRAG_MS_MIN,h));
+  if(isFinite(r)) LONG_RIGHT_MS=Math.min(LONG_RIGHT_MS_MAX,Math.max(LONG_RIGHT_MS_MIN,r));
+  log('拖拽 '+HOLD_DRAG_MS+'ms / 右键 '+LONG_RIGHT_MS+'ms');
+};
+window.plTouchInfo=function(){
+  return {mode:touchMode(),sens:trackpadSens(),x:ptrX,y:ptrY,ready:ptrReady};
+};
+
+// ---------- 外设：手柄指针（原生把摇杆/按键按映射翻译后调用） ----------
+// 鼠标按钮位：1=左, 2=中, 4=右（RFB 掩码）
+let puBtnMask=0;
+function puRefresh(){ moveCursor(ptrX,ptrY); sendPointer(puBtnMask,ptrX,ptrY); }
+window.plPointerButton=function(button,down){     // button: 1 左 / 2 中 / 3 右（X 按钮号）
+  const bit = button===1?1:(button===2?2:(button===3?4:0));
+  if(!bit) return;
+  if(down) puBtnMask|=bit; else puBtnMask&=~bit;
+  puRefresh();
+};
+window.plWheel=function(up){ moveCursor(ptrX,ptrY); wheelAt(ptrX,ptrY,!!up); };
+
+// 左摇杆：原生以 ~30Hz 推 (lx,ly)，JS 用 rAF 积分成相对移动（灵敏度复用触控板）
+const STICK_SPEED=820;        // fb px/s（灵敏度 1.0 时；实际再乘 trackpadSens()）
+let stickX=0, stickY=0, stickRAF=0, stickPrev=0;
+function stickFrame(ts){
+  stickRAF=0;
+  if(!stickX&&!stickY) return;
+  const now=(typeof ts==='number')?ts:((typeof performance!=='undefined'&&performance.now)?performance.now():Date.now());
+  let dt=(now-stickPrev)/1000;
+  if(!isFinite(dt)||dt<=0||dt>0.1) dt=0.016;
+  stickPrev=now;
+  const k=STICK_SPEED*trackpadSens()*dt;
+  ptrX+=stickX*k; ptrY+=stickY*k; clampPtr();
+  moveCursor(ptrX,ptrY); sendPointer(puBtnMask,ptrX,ptrY);
+  stickRAF=requestAnimationFrame(stickFrame);
+}
+window.plStick=function(lx,ly){
+  const nx=Math.max(-1,Math.min(1,Number(lx)||0));
+  const ny=Math.max(-1,Math.min(1,Number(ly)||0));
+  if(nx===stickX&&ny===stickY) return;
+  stickX=nx; stickY=ny;
+  if(!stickRAF&&(stickX||stickY)){
+    stickPrev=(typeof performance!=='undefined'&&performance.now)?performance.now():Date.now();
+    stickRAF=requestAnimationFrame(stickFrame);
+  }
+};
+window.plInputInfo=function(){
+  return {ver:window.PL_VER,mode:touchMode(),sens:trackpadSens(),
+          hold:HOLD_DRAG_MS,right:LONG_RIGHT_MS,btnMask:puBtnMask,
+          stick:[stickX,stickY],ptr:[ptrX,ptrY],ptrReady:ptrReady};
+};
+
+window.plShowKeyboard = function(){ try{ kbi.focus(); }catch(e){} };
+// 物理键盘/手柄按键：按下、抬起分离（组合键需要真实的按下保持）；plKey 保留为“按下+30ms 抬起”
+window.plKeyDown = function(ks){ sendKey(true, ks|0); };
+window.plKeyUp   = function(ks){ sendKey(false, ks|0); };
+window.plKey = function(ks){ window.plKeyDown(ks); setTimeout(function(){ window.plKeyUp(ks); },30); };
+
+// ---------- 键盘 ----------
+const KEYMAP={Backspace:0xFF08,Enter:0xFF0D,Tab:0xFF09,Escape:0xFF1B,ArrowLeft:0xFF51,ArrowUp:0xFF52,
+  ArrowRight:0xFF53,ArrowDown:0xFF54,Delete:0xFFFF,Home:0xFF50,End:0xFF57,PageUp:0xFF55,PageDown:0xFF56,
+  Control:0xFFE3,Alt:0xFFE9,Shift_L:0xFFE1};   // Shift 用 key 名处理
+function sendKey(down,keysym){
+  const b=new Uint8Array(8);
+  b[0]=4; b[1]=down?1:0;
+  b[4]=(keysym>>>24)&255; b[5]=(keysym>>>16)&255; b[6]=(keysym>>>8)&255; b[7]=keysym&255;
+  send(b);
+}
+
+kbi.addEventListener('input',()=>{
+  const v=kbi.value; kbi.value='';
+  for(const ch of v){ const ks=ch.codePointAt(0); if(ks<0x80||ks>0) { sendKey(true,ks); sendKey(false,ks); } }
+});
+kbi.addEventListener('keydown',e=>{
+  if(e.key==='Shift') return;
+  let ks=KEYMAP[e.key];
+  if(ks===undefined && e.key.length===1) ks=e.key.codePointAt(0);
+  if(ks===undefined) return;
+  e.preventDefault(); sendKey(true,ks);
+});
+kbi.addEventListener('keyup',e=>{
+  let ks=KEYMAP[e.key];
+  if(ks===undefined && e.key.length===1) ks=e.key.codePointAt(0);
+  if(ks===undefined) return;
+  sendKey(false,ks); kbi.value='';
+});
+
+connect();
+</script>
+</body></html>

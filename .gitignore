@@ -1,0 +1,10 @@
+*.mp3
+*.png
+*.wav
+scan/
+scan2/
+pocketlinux/app/build/
+pocketlinux/.gradle/
+pocketlinux/build/
+*.log
+.refs/

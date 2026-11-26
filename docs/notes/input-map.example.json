@@ -1,0 +1,27 @@
+{
+  "keyboard": {
+    "KEYCODE_ESCAPE": "Escape",
+    "KEYCODE_TAB": "Tab",
+    "KEYCODE_ENTER": "Return",
+    "KEYCODE_F1": "F1",
+    "KEYCODE_A": "a",
+    "KEYCODE_1": "1",
+    "KEYCODE_CTRL_LEFT": "Control_L",
+    "KEYCODE_SHIFT_LEFT": "Shift_L",
+    "KEYCODE_ALT_LEFT": "Alt_L"
+  },
+  "gamepad": {
+    "BUTTON_A": "mouse_left",
+    "BUTTON_B": "mouse_right",
+    "BUTTON_X": "key:Return",
+    "BUTTON_Y": "key:Escape",
+    "BUTTON_L1": "wheel_up",
+    "BUTTON_R1": "wheel_down",
+    "BUTTON_START": "keyboard",
+    "AXIS_X": "mouse_x",
+    "AXIS_Y": "mouse_y",
+    "AXIS_HAT_X": ["key:Left", "key:Right"],
+    "AXIS_HAT_Y": ["key:Up", "key:Down"],
+    "stick": { "deadzone": 0.15, "speed": 1.0 }
+  }
+}

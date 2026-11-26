@@ -1,0 +1,33 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.pocketlinux.probe'
+    compileSdk 34
+    buildToolsVersion '34.0.4'
+
+    defaultConfig {
+        applicationId 'com.pocketlinux.probe'
+        minSdk 26
+        targetSdk 28
+        versionCode 1
+        versionName '0.1'
+    }
+
+    buildTypes {
+        debug { }
+        release { minifyEnabled false }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packagingOptions {
+        jniLibs {
+            keepDebugSymbols += ['**/libproot.so', '**/libproot_loader.so']
+        }
+    }
+
+    lint { abortOnError false }
+}
